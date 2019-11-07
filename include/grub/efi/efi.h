@@ -77,6 +77,11 @@ grub_err_t EXPORT_FUNC (grub_efi_set_virtual_address_map) (grub_efi_uintn_t memo
 void *EXPORT_FUNC (grub_efi_get_variable) (const char *variable,
 					   const grub_efi_guid_t *guid,
 					   grub_size_t *datasize_out);
+
+char *EXPORT_FUNC (grub_efi_get_next_variable_name) (grub_efi_uintn_t *size,
+                                                     char *name,
+                                                     grub_efi_guid_t *vendor_guid);
+
 grub_err_t
 EXPORT_FUNC (grub_efi_set_variable) (const char *var,
 				     const grub_efi_guid_t *guid,

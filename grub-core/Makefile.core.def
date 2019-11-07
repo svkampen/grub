@@ -805,6 +805,12 @@ module = {
 };
 
 module = {
+  name = efibootvars;
+  efi = commands/efi/efibootvars.c;
+  enable = efi;
+};
+
+module = {
   name = blocklist;
   common = commands/blocklist.c;
 };

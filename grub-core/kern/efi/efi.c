@@ -191,6 +191,56 @@ grub_efi_set_virtual_address_map (grub_efi_uintn_t memory_map_size,
   return grub_error (GRUB_ERR_IO, "set_virtual_address_map failed");
 }
 
+/*
+ * Verify that more than half of variable storage is available
+ * after a variable has been set, to avoid bricking bad firmwares.
+ */
+static int
+verify_enough_available_var_space (grub_efi_char16_t *name,
+				   const grub_efi_guid_t *guid,
+				   grub_size_t datasize)
+{
+  grub_efi_runtime_services_t *r = grub_efi_system_table->runtime_services;
+  grub_efi_uintn_t current_datasize = 0;
+  grub_efi_uint32_t attrs = (GRUB_EFI_VARIABLE_NON_VOLATILE
+			     | GRUB_EFI_VARIABLE_RUNTIME_ACCESS
+			     | GRUB_EFI_VARIABLE_BOOTSERVICE_ACCESS);
+  grub_size_t data_delta;
+  grub_efi_status_t status;
+  grub_efi_uint64_t max_storage_size, remaining_storage_size, max_var_size;
+
+  /*
+   * QueryVariableInfo is new in UEFI 2.0. If it doesn't exist,
+   * just return 1, since we may still want to allow variable setting
+   * even on UEFI versions <2.
+   */
+  if (! (r->hdr.revision & (2 << 16)))
+      return 1;
+
+  status = efi_call_4 (r->query_variable_info, attrs, &max_storage_size,
+		       &remaining_storage_size, &max_var_size);
+
+  /* If QueryVariableInfo is unsupported, also still allow. */
+  if (status == GRUB_EFI_UNSUPPORTED)
+      return 1;
+
+  status = efi_call_5 (r->get_variable, name, guid, NULL, &current_datasize,
+		       NULL);
+
+  if (status != GRUB_EFI_BUFFER_TOO_SMALL)
+    /* We can't get the current size of the variable. */
+    data_delta = datasize;
+  else
+    data_delta = (datasize > current_datasize)
+		 ? datasize - current_datasize
+		 : current_datasize - datasize;
+
+  grub_dprintf ("efi", "Total / Available variable space: %llu/%llu\n",
+		max_storage_size, remaining_storage_size);
+
+  return (remaining_storage_size - data_delta >= (max_storage_size / 2));
+}
+
 grub_err_t
 grub_efi_set_variable(const char *var, const grub_efi_guid_t *guid,
 		      void *data, grub_size_t datasize)
@@ -208,6 +258,13 @@ grub_efi_set_variable(const char *var, const grub_efi_guid_t *guid,
   len16 = grub_utf8_to_utf16 (var16, len16, (grub_uint8_t *) var, len, NULL);
   var16[len16] = 0;
 
+  if (! verify_enough_available_var_space (var16, guid, datasize))
+    {
+      grub_free (var16);
+      return grub_error (GRUB_ERR_BAD_ARGUMENT, "setting `%s' would decrease "
+			 "available variable storage below half", var);
+    }
+
   r = grub_efi_system_table->runtime_services;
 
   status = efi_call_5 (r->set_variable, var16, guid, 
@@ -220,6 +277,101 @@ grub_efi_set_variable(const char *var, const grub_efi_guid_t *guid,
     return GRUB_ERR_NONE;
 
   return grub_error (GRUB_ERR_IO, "could not set EFI variable `%s'", var);
+}
+
+/*
+ * Get the next variable name from the firmware.
+ *
+ * Parameters:
+ *  size: in-out param, pointer to current size of variable name buffer
+ *  name: in-param, pointer to variable name buffer
+ *  vendor_guid: in-out param, pointer to current variable's vendor GUID.
+ *
+ * Returns a pointer to the next variable name. If possible, reuses the
+ * given name buffer.
+ *
+ * Freeing the result of this function is only needed at the end of a
+ * sequence of calls, since realloc is used.
+ *
+ * On first call, pass in name = NULL. A buffer will be allocated for you.
+ *
+ * When there is no next variable name, or on error, returns NULL.
+ */
+char *
+grub_efi_get_next_variable_name (grub_efi_uintn_t *size,
+                                 char *name,
+                                 grub_efi_guid_t *vendor_guid)
+{
+  /* buffer size, number of characters in buffer */
+  grub_efi_uintn_t size16, len16 = 0;
+  grub_efi_status_t status;
+  grub_efi_char16_t *tmp16, *name16 = NULL;
+  char *new_name = NULL;
+  grub_efi_runtime_services_t *r = grub_efi_system_table->runtime_services;
+
+  if (! size || ! vendor_guid)
+    {
+      grub_error (GRUB_ERR_BAD_ARGUMENT, "no size or no vendor guid supplied");
+      return NULL;
+    }
+
+  /* If this is the first call, pick some reasonable buffer size (128 chars). */
+  size16 = (name ? (*size) : 128) * GRUB_MAX_UTF16_PER_UTF8 * sizeof (*name16);
+  name16 = grub_malloc (size16);
+
+  if (! name16)
+    goto err;
+
+  /* If a name is given, convert it to UTF-16. */
+  if (name)
+    {
+      len16 = grub_utf8_to_utf16 (name16, size16 / 2, (grub_uint8_t *) name,
+				  (*size), 0);
+    }
+  name16[len16] = 0;
+
+retry:
+  status = efi_call_3 (r->get_next_variable_name, &size16, name16, vendor_guid);
+
+  switch (status)
+    {
+    case GRUB_EFI_BUFFER_TOO_SMALL:
+      tmp16 = grub_realloc (name16, size16);
+
+      if (! tmp16)
+	goto err;
+
+      name16 = tmp16;
+      goto retry;
+    case GRUB_EFI_DEVICE_ERROR:
+    case GRUB_EFI_UNSUPPORTED:
+      grub_error (GRUB_ERR_IO, "unable to get next variable from firmware");
+      goto err;
+    case GRUB_EFI_INVALID_PARAMETER:
+      grub_error (GRUB_ERR_BAD_ARGUMENT, "non-existent variable name, vendor "
+		  "guid, or invalid variable name size");
+      goto err;
+    case GRUB_EFI_SUCCESS:
+      break;
+    case GRUB_EFI_NOT_FOUND:
+    default:
+      goto err;
+    }
+
+  /* Convert the new name back into UTF-8 */
+  for (len16 = 0; name16[len16] != 0; ++len16);
+
+  *size = GRUB_MAX_UTF8_PER_UTF16 * len16;
+  new_name = grub_realloc (name, *size);
+
+  if (! new_name)
+    goto err;
+
+  *grub_utf16_to_utf8 ((grub_uint8_t *) new_name, name16, size16 / 2) = 0;
+
+err:
+  grub_free (name16);
+  return new_name;
 }
 
 void *
